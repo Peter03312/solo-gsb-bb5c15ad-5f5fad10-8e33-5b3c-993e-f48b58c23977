@@ -14,6 +14,10 @@ CREATE TABLE IF NOT EXISTS projects (
   sub_version INTEGER NOT NULL DEFAULT 0,   -- 字幕集每次变更（编辑/锁定/重排）都 +1，用于乐观锁
   -- 归属版本：说话人显示名修改或归属标注写入时 +1；归属标注与署名导出携带以防并发覆盖
   attribution_version INTEGER NOT NULL DEFAULT 0,
+  -- 逐词导入代数：新建项目首次导入为 1，每次重新导入（/import 替换转写）+1。
+  -- 译文保存时记录当时代数；重排删除行的历史译文与当前行同代且词区间/源文本一致才可恢复，
+  -- 重新导入留下的历史译文（代数不同）与无法确认归属的旧历史译文（NULL）仅供查看。
+  import_id   INTEGER NOT NULL DEFAULT 1,
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -139,6 +143,10 @@ CREATE TABLE IF NOT EXISTS translations (
   src_end_ms           INTEGER NOT NULL,             -- 保存时源字幕结束毫秒快照
   src_word_start       INTEGER NOT NULL,             -- 保存时源字幕词区间快照
   src_word_end         INTEGER NOT NULL,
+  -- 保存/确认译文时的逐词导入代数（projects.import_id 快照）：重排删除行的历史译文
+  -- 与当前行同代（且词区间/源文本一致）才可恢复；旧库迁移来的行为 NULL（无法确认
+  -- 导入归属），与重新导入留下的历史译文（代数不同）一样仅供查看、不能恢复。
+  import_id            INTEGER,
   created_at           TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -328,11 +336,20 @@ function initDb(dbPath) {
 /**
  * 轻量迁移：旧库在本次新增 speakers/attributions 前已建表，补齐列。
  * CREATE TABLE IF NOT EXISTS 只负责新表；已存在的 projects 表需要手动加列。
+ * import_id：projects 补当前导入代数（默认 1）；translations 补保存时导入代数
+ * （旧行留 NULL = 无法确认导入归属的旧历史译文，仅供查看、不能恢复）。
  */
 function migrate(db) {
   const cols = db.prepare('PRAGMA table_info(projects)').all().map((c) => c.name);
   if (!cols.includes('attribution_version')) {
     db.exec('ALTER TABLE projects ADD COLUMN attribution_version INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!cols.includes('import_id')) {
+    db.exec('ALTER TABLE projects ADD COLUMN import_id INTEGER NOT NULL DEFAULT 1');
+  }
+  const tcols = db.prepare('PRAGMA table_info(translations)').all().map((c) => c.name);
+  if (!tcols.includes('import_id')) {
+    db.exec('ALTER TABLE translations ADD COLUMN import_id INTEGER');
   }
 }
 
@@ -372,6 +389,7 @@ function loadProject(db, id) {
     name: project.name,
     sub_version: project.sub_version,
     attribution_version: project.attribution_version,
+    import_id: project.import_id,
     created_at: project.created_at,
     words,
     cuts,

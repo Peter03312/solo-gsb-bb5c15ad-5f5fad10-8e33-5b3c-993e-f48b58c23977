@@ -101,6 +101,7 @@ const mapRow = (r) => ({
   src_end_ms: r.src_end_ms,
   src_word_start: r.src_word_start,
   src_word_end: r.src_word_end,
+  import_id: r.import_id === undefined ? null : r.import_id,
   created_at: r.created_at,
   updated_at: r.updated_at,
 });
