@@ -4,6 +4,7 @@ const express = require('express');
 const {
   loadProject, listRevisions, loadRevision,
   listWordRevisions, loadWordRevision, bumpSubVersion, bumpAttributionVersion,
+  bumpImportVersion,
   DEFAULT_RULES,
 } = require('./db');
 const { computeLayout, validateStructure, validateRules } = require('./layout');
@@ -32,6 +33,10 @@ const {
   parseGlossaryBody, StaleGlossaryError, getGlossary, listGlossaries, replaceGlossary,
   evaluateTerms, checkTerms,
 } = glossaryMod;
+const {
+  parseRecoveryBody, buildRecoveryView, evaluateRecovery,
+  SHAPE_STATES: RECOVERY_SHAPE_STATES, STALE_STATES: RECOVERY_STALE_STATES,
+} = require('./translation-recovery');
 const { toWebVtt } = require('./vtt');
 
 /**
@@ -136,6 +141,9 @@ function createApp(db) {
       const insCut = db.prepare('INSERT INTO shots (project_id, idx, cut_ms) VALUES (?, ?, ?)');
       c.cuts.forEach((ms, i) => insCut.run(p.id, i, ms));
       bumpSubVersion(db, p.id);
+      // 逐词整体替换 → 新的导入代次：旧代次译文即使词区间/文本相同也无法确认导入归属，
+      // 只留作历史、不可恢复。
+      bumpImportVersion(db, p.id);
     });
     tx();
     // 旧字幕行已全部删除：各语言译文全部留作历史（不按序号挪用到新排版的行）；
@@ -1303,6 +1311,186 @@ function createApp(db) {
     res.json(buildLangView(db, p.id, lang));
   });
 
+  // ---------- 重排后历史译文找回（候选查看 → 组级恢复） ----------
+  //
+  // 重排删除源行后，译文留作 history（绝不按序号自动挪用）。新排版产生的缺译行，
+  // 若历史译文与当前行来自同一次逐词导入（projects.import_version）、词区间与源字幕
+  // 文本均一致，校对者可显式恢复为一条普通 current 译文。重新导入留下的旧代次历史、
+  // 无法确认导入归属（src_import_id 为 NULL）的旧历史仅供查看、不能恢复。
+  //
+  // 恢复请求携带读取时字幕集 sub_version、规则 rules_version 与逐行选择
+  // {subtitle_id, cue_version, translation_id, version}，一次可选择多行；服务端在同一
+  // 事务内重新核对目标仍缺译、候选三要素匹配与现行字数/字速，任一失效按行说明且整组
+  // 不写。恢复是 INSERT 新的普通 current 译文（版本 1），原 history 行保留不改；
+  // 不推进 sub_version、不改历史记录与旧导出快照；术语缺失仍在译文视图提示并阻止导出。
+
+  /**
+   * 候选查询（只读）：列出该语言当前缺译行的全部历史候选及匹配依据。
+   * GET …/translations/:lang/recovery-candidates
+   */
+  app.get('/api/projects/:id/translations/:lang/recovery-candidates', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const lang = getLang(req, res);
+    if (!lang) return;
+    res.json(buildRecoveryView(db, p.id, lang));
+  });
+
+  /**
+   * 组级恢复：
+   * POST …/translations/:lang/recover
+   *   {sub_version, rules_version,
+   *    items:[{subtitle_id, cue_version, translation_id, version}]}
+   * 201 整组恢复成功（每行新建 current 译文 v1；原历史行保留）；
+   * 400 请求形状非法或候选译文不属于本项目/本语言/不是历史；
+   * 409 字幕集或规则版本漂移、行版本过期、目标已不缺译、候选版本/匹配失效；
+   * 422 候选译文违反现行字数/字速。任一失败按行返回当前值与原因，整组不写入。
+   */
+  app.post('/api/projects/:id/translations/:lang/recover', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const lang = getLang(req, res);
+    if (!lang) return;
+
+    const parsed = parseRecoveryBody(req.body);
+    if (!parsed.ok) {
+      return res.status(400).json({ error: '历史译文恢复请求非法，未恢复任何译文', errors: parsed.errors });
+    }
+    const request = parsed.request;
+
+    class RecoveryReject extends Error {
+      constructor(statusCode, payload) {
+        super(payload.error || '历史译文恢复被拒绝');
+        this.statusCode = statusCode;
+        this.payload = payload;
+      }
+    }
+
+    const tx = db.transaction(() => {
+      // 事务内读取权威当前状态重新核对（防止读取后字幕集/规则/译文发生变化）
+      const fresh = loadProject(db, p.id);
+      const evaluation = evaluateRecovery(db, fresh, lang, request);
+
+      // 顶层版本漂移（字幕集/规则）→ 409，带当前值
+      if (evaluation.sub_version_stale || evaluation.rules_version_stale) {
+        const why = [];
+        if (evaluation.sub_version_stale) {
+          why.push(`字幕集版本漂移：提交基于 v${request.sub_version}，当前已是 v${fresh.sub_version}`);
+        }
+        if (evaluation.rules_version_stale) {
+          why.push(`规则版本漂移：提交基于 v${request.rules_version}，当前已是 v${fresh.rules.version}`);
+        }
+        throw new RecoveryReject(409, {
+          error: `${why.join('；')}；整组未恢复，请刷新候选后重新提交`,
+          sub_version_stale: evaluation.sub_version_stale,
+          rules_version_stale: evaluation.rules_version_stale,
+          current: {
+            sub_version: fresh.sub_version,
+            rules_version: fresh.rules.version,
+            rules: fresh.rules,
+            subtitles: fresh.subtitles,
+          },
+          items: evaluation.items
+            .filter((it) => it.state !== 'ok')
+            .map((it) => ({
+              ord: it.ord, subtitle_id: it.subtitle_id, state: it.state,
+              cue: it.cue, current: it.current,
+              candidate: it.candidate, reasons: it.reasons,
+            })),
+        });
+      }
+
+      const bad = evaluation.items.filter((it) => it.state !== 'ok');
+      if (bad.length > 0) {
+        // 候选本身不存在/不属于该语言/不是历史 → 400（请求指向了无效资源）；
+        // 其余过期/失效类 → 409；仅规则违规（invalid）→ 422。一行 400 整组按 400。
+        const hasShape = bad.some((it) => RECOVERY_SHAPE_STATES.has(it.state));
+        const hasStale = bad.some((it) => RECOVERY_STALE_STATES.has(it.state));
+        const statusCode = hasShape ? 400 : (hasStale ? 409 : 422);
+        throw new RecoveryReject(statusCode, {
+          error: hasShape
+            ? `恢复请求包含无效候选，整组未恢复（共 ${bad.length} 行有问题），请重新拉取候选列表`
+            : hasStale
+              ? `恢复组存在 ${bad.length} 行过期/失效项，整组未恢复，请刷新候选后重新提交`
+              : `恢复组有 ${bad.length} 行候选译文不满足当前字数/字速规则，整组未恢复`,
+          sub_version: fresh.sub_version,
+          rules_version: fresh.rules.version,
+          items: bad.map((it) => ({
+            ord: it.ord,
+            subtitle_id: it.subtitle_id,
+            cue_version: it.cue_version,
+            translation_id: it.translation_id,
+            version: it.version,
+            state: it.state,
+            cue: it.cue,
+            current: it.current,
+            candidate: it.candidate,
+            reasons: it.reasons,
+          })),
+        });
+      }
+
+      // 全部通过：逐行 INSERT 一条新的普通 current 译文（版本从 1 开始）。
+      // 原 history 行保持不变（历史记录不改）；不推进 sub_version（只写译文，与回填一致）。
+      const currentImportId = fresh.import_version;
+      const ins = db.prepare(
+        `INSERT INTO translations
+           (project_id, lang, subtitle_id, text, status, version, cue_version_snapshot,
+            src_text, src_start_ms, src_end_ms, src_word_start, src_word_end, src_import_id)
+         VALUES (?, ?, ?, ?, 'current', 1, ?, ?, ?, ?, ?, ?, ?)`
+      );
+      const glossary = getGlossary(db, fresh.id, lang);
+      const applied = [];
+      for (const it of evaluation.items) {
+        const cue = it.cue;
+        const info = ins.run(
+          fresh.id, lang, cue.id, it.text, cue.version, cue.text,
+          cue.start_ms, cue.end_ms, cue.word_start, cue.word_end, currentImportId
+        );
+        // 部分唯一索引兜底：并发写入导致该语言该字幕已有非历史译文 → 整组回滚
+        if (info.changes !== 1) {
+          throw new RecoveryReject(409, {
+            error: `字幕 ${cue.id} 在恢复瞬间出现了译文，请刷新候选后重新提交整组`,
+            current: { sub_version: fresh.sub_version },
+          });
+        }
+        const row = db.prepare('SELECT * FROM translations WHERE id = ?').get(info.lastInsertRowid);
+        const termCheck = checkTerms(cue.text, row.text, glossary.terms);
+        applied.push({
+          ord: it.ord,
+          subtitle_id: cue.id,
+          translation_id: row.id,
+          restored_from: it.translation_id,
+          version: 1,
+          text: row.text,
+          // 术语缺失只作提示：仍可恢复，但继续按既有译文视图/导出闸门阻止导出
+          glossary_version: glossary.version,
+          term_issues: termCheck.missing,
+        });
+      }
+
+      return { applied, import_version: currentImportId, glossary_version: glossary.version };
+    });
+
+    try {
+      const done = tx();
+      const after = loadProject(db, p.id);
+      return res.status(201).json({
+        lang,
+        sub_version: after.sub_version,
+        rules_version: after.rules.version,
+        import_version: done.import_version,
+        restored_count: done.applied.length,
+        items: done.applied,
+      });
+    } catch (err) {
+      if (err instanceof RecoveryReject) {
+        return res.status(err.statusCode).json(err.payload);
+      }
+      throw err;
+    }
+  });
+
   // ---------- 译审术语对照表（按项目 + 目标语言维护源词 → 规定译法） ----------
   //
   // 整表修改（整体替换词条）并携带读取时术语版本 version：未配置传 0，已配置须传
@@ -1433,25 +1621,26 @@ function createApp(db) {
 
     let statusCode = 200;
     const tx = db.transaction(() => {
+      const importId = db.prepare('SELECT import_version FROM projects WHERE id = ?').get(p.id).import_version;
       if (existing) {
         db.prepare(
           `UPDATE translations SET text = ?, version = version + 1, status = 'current',
              cue_version_snapshot = ?, src_text = ?, src_start_ms = ?, src_end_ms = ?,
-             src_word_start = ?, src_word_end = ?, updated_at = datetime('now')
+             src_word_start = ?, src_word_end = ?, src_import_id = ?, updated_at = datetime('now')
            WHERE id = ?`
         ).run(
           parsed.item.text, cue.version, cue.text, cue.start_ms, cue.end_ms,
-          cue.word_start, cue.word_end, existing.id
+          cue.word_start, cue.word_end, importId, existing.id
         );
       } else {
         db.prepare(
           `INSERT INTO translations
              (project_id, lang, subtitle_id, text, status, version, cue_version_snapshot,
-              src_text, src_start_ms, src_end_ms, src_word_start, src_word_end)
-           VALUES (?, ?, ?, ?, 'current', 1, ?, ?, ?, ?, ?, ?)`
+              src_text, src_start_ms, src_end_ms, src_word_start, src_word_end, src_import_id)
+           VALUES (?, ?, ?, ?, 'current', 1, ?, ?, ?, ?, ?, ?, ?)`
         ).run(
           p.id, lang, sid, parsed.item.text, cue.version, cue.text,
-          cue.start_ms, cue.end_ms, cue.word_start, cue.word_end
+          cue.start_ms, cue.end_ms, cue.word_start, cue.word_end, importId
         );
         statusCode = 201;
       }
@@ -1522,11 +1711,15 @@ function createApp(db) {
       });
     }
 
-    db.prepare(
-      `UPDATE translations SET status = 'current', cue_version_snapshot = ?,
-         src_text = ?, src_start_ms = ?, src_end_ms = ?, src_word_start = ?, src_word_end = ?,
-         version = version + 1, updated_at = datetime('now') WHERE id = ?`
-    ).run(cue.version, cue.text, cue.start_ms, cue.end_ms, cue.word_start, cue.word_end, row.id);
+    db.transaction(() => {
+      const importId = db.prepare('SELECT import_version FROM projects WHERE id = ?').get(p.id).import_version;
+      db.prepare(
+        `UPDATE translations SET status = 'current', cue_version_snapshot = ?,
+           src_text = ?, src_start_ms = ?, src_end_ms = ?, src_word_start = ?, src_word_end = ?,
+           src_import_id = ?, version = version + 1, updated_at = datetime('now') WHERE id = ?`
+      ).run(cue.version, cue.text, cue.start_ms, cue.end_ms, cue.word_start, cue.word_end,
+        importId, row.id);
+    })();
     const updated = db.prepare('SELECT * FROM translations WHERE id = ?').get(row.id);
     const confirmGlossary = getGlossary(db, p.id, lang);
     const confirmTermCheck = checkTerms(cue.text, updated.text, confirmGlossary.terms);
@@ -1792,16 +1985,19 @@ function createApp(db) {
       // 5. 全部通过：同一事务保存全部译文。
       //    新建 → INSERT 版本 1；更新（含覆盖待复核）→ UPDATE 版本 +1、源快照刷新为 current。
       //    WHERE 条件带 version 兜底，防止核对与写入之间的并发改动。
+      const currentImportId = db.prepare(
+        'SELECT import_version FROM projects WHERE id = ?'
+      ).get(fresh.id).import_version;
       const ins = db.prepare(
         `INSERT INTO translations
            (project_id, lang, subtitle_id, text, status, version, cue_version_snapshot,
-            src_text, src_start_ms, src_end_ms, src_word_start, src_word_end)
-         VALUES (?, ?, ?, ?, 'current', 1, ?, ?, ?, ?, ?, ?)`
+            src_text, src_start_ms, src_end_ms, src_word_start, src_word_end, src_import_id)
+         VALUES (?, ?, ?, ?, 'current', 1, ?, ?, ?, ?, ?, ?, ?)`
       );
       const upd = db.prepare(
         `UPDATE translations SET text = ?, version = version + 1, status = 'current',
            cue_version_snapshot = ?, src_text = ?, src_start_ms = ?, src_end_ms = ?,
-           src_word_start = ?, src_word_end = ?, updated_at = datetime('now')
+           src_word_start = ?, src_word_end = ?, src_import_id = ?, updated_at = datetime('now')
          WHERE id = ? AND project_id = ? AND version = ?`
       );
 
@@ -1814,7 +2010,7 @@ function createApp(db) {
         if (existing) {
           const info = upd.run(
             it.text, cue.version, cue.text, cue.start_ms, cue.end_ms,
-            cue.word_start, cue.word_end, existing.id, fresh.id, existing.version
+            cue.word_start, cue.word_end, currentImportId, existing.id, fresh.id, existing.version
           );
           if (info.changes !== 1) {
             throw new BatchReject(409, {
@@ -1828,7 +2024,7 @@ function createApp(db) {
         } else {
           ins.run(
             fresh.id, lang, cue.id, it.text, cue.version, cue.text,
-            cue.start_ms, cue.end_ms, cue.word_start, cue.word_end
+            cue.start_ms, cue.end_ms, cue.word_start, cue.word_end, currentImportId
           );
           it.action = 'created';
           it.result_version = 1;

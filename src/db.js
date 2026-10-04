@@ -14,6 +14,10 @@ CREATE TABLE IF NOT EXISTS projects (
   sub_version INTEGER NOT NULL DEFAULT 0,   -- 字幕集每次变更（编辑/锁定/重排）都 +1，用于乐观锁
   -- 归属版本：说话人显示名修改或归属标注写入时 +1；归属标注与署名导出携带以防并发覆盖
   attribution_version INTEGER NOT NULL DEFAULT 0,
+  -- 逐词导入代次：项目创建（首次导入）为 1，每次 /import 重新导入 +1。
+  -- 词、字幕与译文源快照都记录所属代次；历史译文仅当与当前行同代次（同一次逐词导入）
+  -- 且词区间、源字幕文本一致时才允许恢复，重新导入前的旧译文无法确认归属、仅供查看。
+  import_version INTEGER NOT NULL DEFAULT 1,
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -125,6 +129,9 @@ CREATE TABLE IF NOT EXISTS word_revision_items (
 --   current  当前有效（源文本/时间/词区间与快照一致且满足现行规则）
 --   review   待复核（保存后源字幕文本、时间或词区间发生变化；仅锁定/展示顺序变化不进入此态）
 --   history  历史（源字幕行被重排删除或重新导入；subtitle_id 置空，不自动挪用到新行）
+-- src_import_id 记录该译文保存时源行所属的逐词导入代次（projects.import_version）；
+--   历史译文恢复时必须与当前行所属代次相同——重排删除行的历史（同一次导入）可恢复，
+--   重新导入前的历史（旧代次）与无法确认导入归属（NULL，旧库迁移）的历史仅供查看。
 CREATE TABLE IF NOT EXISTS translations (
   id                   INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id           INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -139,6 +146,7 @@ CREATE TABLE IF NOT EXISTS translations (
   src_end_ms           INTEGER NOT NULL,             -- 保存时源字幕结束毫秒快照
   src_word_start       INTEGER NOT NULL,             -- 保存时源字幕词区间快照
   src_word_end         INTEGER NOT NULL,
+  src_import_id        INTEGER,                      -- 保存时源行所属逐词导入代次（可空：无法确认归属的旧数据）
   created_at           TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -326,13 +334,23 @@ function initDb(dbPath) {
 }
 
 /**
- * 轻量迁移：旧库在本次新增 speakers/attributions 前已建表，补齐列。
- * CREATE TABLE IF NOT EXISTS 只负责新表；已存在的 projects 表需要手动加列。
+ * 轻量迁移：CREATE TABLE IF NOT EXISTS 只负责新表；旧库已存在的表需要手动加列。
+ *   - projects.attribution_version（说话人功能引入）
+ *   - projects.import_version（历史译文恢复引入：逐词导入代次，旧库当前词集视为第 1 代）
+ *   - translations.src_import_id（保存时源行所属导入代次；旧译文留 NULL 表示无法确认
+ *     导入归属——仍在并列视图与历史中可见，但不能通过恢复接口写回）
  */
 function migrate(db) {
-  const cols = db.prepare('PRAGMA table_info(projects)').all().map((c) => c.name);
-  if (!cols.includes('attribution_version')) {
+  const projectCols = db.prepare('PRAGMA table_info(projects)').all().map((c) => c.name);
+  if (!projectCols.includes('attribution_version')) {
     db.exec('ALTER TABLE projects ADD COLUMN attribution_version INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!projectCols.includes('import_version')) {
+    db.exec('ALTER TABLE projects ADD COLUMN import_version INTEGER NOT NULL DEFAULT 1');
+  }
+  const trCols = db.prepare('PRAGMA table_info(translations)').all().map((c) => c.name);
+  if (!trCols.includes('src_import_id')) {
+    db.exec('ALTER TABLE translations ADD COLUMN src_import_id INTEGER');
   }
 }
 
@@ -372,6 +390,7 @@ function loadProject(db, id) {
     name: project.name,
     sub_version: project.sub_version,
     attribution_version: project.attribution_version,
+    import_version: project.import_version,
     created_at: project.created_at,
     words,
     cuts,
@@ -446,6 +465,12 @@ function bumpAttributionVersion(db, projectId) {
   return db.prepare('SELECT attribution_version FROM projects WHERE id = ?').get(projectId).attribution_version;
 }
 
+/** 逐词导入代次 +1（重新导入转写时调用），返回推进后的代次 */
+function bumpImportVersion(db, projectId) {
+  db.prepare('UPDATE projects SET import_version = import_version + 1 WHERE id = ?').run(projectId);
+  return db.prepare('SELECT import_version FROM projects WHERE id = ?').get(projectId).import_version;
+}
+
 /** 项目下全部逐词修正提议摘要（不含逐项明细），按时间倒序 */
 function listWordRevisions(db, projectId) {
   return db.prepare(
@@ -496,5 +521,6 @@ function loadWordRevision(db, projectId, revisionId) {
 module.exports = {
   initDb, loadProject, listRevisions, loadRevision,
   listWordRevisions, loadWordRevision, bumpSubVersion, bumpAttributionVersion,
+  bumpImportVersion,
   DEFAULT_RULES,
 };
